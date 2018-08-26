@@ -1,0 +1,858 @@
+<html lang="en">
+	<head>
+		<title>WebGL Volume Rendering</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+		<style>
+			body {
+				color: #ffffff;
+				font-family:Monospace;
+				font-size:13px;
+				text-align:center;
+				font-weight: bold;
+
+				background-color: #050505;
+				margin: 0px;
+				overflow: hidden;
+			}
+
+			#info {
+				position: absolute;
+				top: 0px; width: 100%;
+				padding: 5px;
+			}
+
+			a {
+				color: #ffffff;
+			}
+
+			#oldie a { color:#da0 }
+
+			#ui {
+				position: absolute;
+				bottom: 10px;
+				left: 50%;
+				transform: translate(-50%, -50%);
+				text-align: center;
+				font-family: 'Karla', sans-serif;
+				z-index: 1;
+			}
+		</style>
+	</head>
+	<body>
+		<div id="container">
+			<div>Transfer function</div>
+			0.0<img id="transferFunctionImg" style="align:right"/>1.0
+		</div>
+
+		<div id="ui">
+	    <div id="vr-button"></div>
+	    <a id="magic-window" href="#">Try it without a headset</a>
+	  </div>
+
+		<script src="./js/three.min.js"></script>
+		<script src="./js/Detector.js"></script>
+		<script src="./js/stats.min.js"></script>
+		<script src="./js/OrbitControls.js"></script>
+		<script src="./js/dat.gui.min.js"></script>
+
+		<script src="./js/webvr-ui/build/webvr-ui.min.js"></script>
+		<script src="./js/VRControls.js"></script>
+		<script src="./js/VREffect.js"></script>
+
+		<script src="js/ViveController.js"></script>
+		<script src="js/WebVR.js"></script>
+
+		<script src="js/OBJLoader.js"></script>
+
+		<script id="vertexShaderFirstPass" type="x-shader/x-vertex">
+			varying vec3 worldSpaceCoords;
+
+			void main(){
+				//Set the world space coordinates of the back faces vertices as output.           无需坐标变换？？？？
+				//worldSpaceCoords = position + vec3(0.5, 0.5, 0.5); //move it from [-0.5;0.5] to [0,1]，从webgl坐标到纹理坐标？！
+				worldSpaceCoords = ( vec4(position + vec3(0.5, 0.5, 0.5), 1.0 )).xyz;  // ??????? 模型矩阵
+				gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+			}
+		</script>
+		<script id="fragmentShaderFirstPass" type="x-shader/x-fragment">
+			varying vec3 worldSpaceCoords;
+
+			void main(){
+				//The fragment's world space coordinates as fragment output.              无需坐标变换？？？？
+				gl_FragColor = vec4( worldSpaceCoords.x , worldSpaceCoords.y, worldSpaceCoords.z, 1 );
+			}
+		</script>
+		<script id="vertexShaderSecondPass" type="x-shader/x-vertex">
+			varying vec3 worldSpaceCoords;
+			varying vec4 projectedCoords;
+
+			void main(){
+				worldSpaceCoords = (vec4(position + vec3(0.5, 0.5, 0.5), 1.0 )).xyz;
+				gl_Position = projectionMatrix *  modelViewMatrix * vec4( position, 1.0 );
+				projectedCoords =  projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+			}
+		</script>
+		<script id="fragmentShaderSecondPass" type="x-shader/x-fragment">
+			varying vec3 worldSpaceCoords;
+			varying vec4 projectedCoords;
+			uniform sampler2D tex, cubeTex, transferTex;
+			uniform float steps;
+			uniform float alphaCorrection;
+
+			uniform vec3 point;
+			uniform vec3 norm;
+			//vec3 p = point;
+			vec3 p = point + vec3(0.5, 0.5, 0.5);	//由于立方体的Y值设置为1, 不需要变化了，因为是相对坐标
+
+			// The maximum distance through our rendering volume is sqrt(3).
+			// The maximum number of steps we take to travel a distance of 1 is 512.
+			// ceil( sqrt(3) * 512 ) = 887
+			// This prevents the back of the image from getting cut off when steps=512 & viewing diagonally.
+			const int MAX_STEPS = 887;
+
+			//Acts like a texture3D using Z slices and trilinear filtering.三线性过滤
+			vec4 sampleAs3DTexture( vec3 texCoord ){
+				vec4 colorSlice1, colorSlice2;
+				vec2 texCoordSlice1, texCoordSlice2;
+
+				//The z coordinate determines which Z slice we have to look for.
+				//Z slice number goes from 0 to 255.
+				float zSliceNumber1 = floor(texCoord.z  * 255.0);
+
+				//As we use trilinear we go the next Z slice.
+				float zSliceNumber2 = min( zSliceNumber1 + 1.0, 255.0); //Clamp to 255
+
+				//The Z slices are stored in a matrix of 16x16 of Z slices.
+				//The original UV coordinates have to be rescaled by the tile numbers in each row and column.
+				texCoord.xy /= 16.0;
+
+				texCoordSlice1 = texCoordSlice2 = texCoord.xy;
+
+				//Add an offset to the original UV coordinates depending on the row and column number.
+				texCoordSlice1.x += (mod(zSliceNumber1, 16.0 ) / 16.0);
+				texCoordSlice1.y += floor((255.0 - zSliceNumber1) / 16.0) / 16.0;
+
+				texCoordSlice2.x += (mod(zSliceNumber2, 16.0 ) / 16.0);
+				texCoordSlice2.y += floor((255.0 - zSliceNumber2) / 16.0) / 16.0;
+
+				//Get the opacity value from the 2D texture.
+				//Bilinear filtering is done at each texture2D by default.
+				colorSlice1 = texture2D( cubeTex, texCoordSlice1 );
+				colorSlice2 = texture2D( cubeTex, texCoordSlice2 );
+
+				//Based on the opacity obtained earlier, get the RGB color in the transfer function texture.
+				colorSlice1.rgba = texture2D( transferTex, vec2( colorSlice1.a, 1.0) ).rgba;
+				colorSlice2.rgba = texture2D( transferTex, vec2( colorSlice2.a, 1.0) ).rgba;
+
+				//How distant is zSlice1 to ZSlice2. Used to interpolate between one Z slice and the other.
+				float zDifference = mod(texCoord.z * 255.0, 1.0);
+
+				//Finally interpolate between the two intermediate colors of each Z slice.
+				return mix(colorSlice1, colorSlice2, zDifference) ;
+			}
+
+
+			void main( void ) {
+
+				//Transform the coordinates it from [-1;1] to [0;1]  纹理坐标
+				vec2 texc = vec2(((projectedCoords.x / projectedCoords.w) + 1.0 ) / 2.0,
+								((projectedCoords.y / projectedCoords.w) + 1.0 ) / 2.0 );
+
+				//The back position is the world space position stored in the texture.
+				vec3 backPos = texture2D(tex, texc).xyz;
+
+				//The front position is the world space position of the second render pass.
+				vec3 frontPos = worldSpaceCoords;
+
+				//The direction from the front position to back position.
+				vec3 dir = backPos - frontPos;
+
+				float rayLength = length(dir);
+
+				//Calculate how long to increment in each step.
+				float delta = 1.0 / steps;
+
+				//The increment增量 in each direction for each step.
+				vec3 deltaDirection = normalize(dir) * delta;
+				float deltaDirectionLength = length(deltaDirection);
+
+				//Start the ray casting from the front position.
+				vec3 currentPosition = frontPos;
+
+				//The color accumulator.
+				vec4 accumulatedColor = vec4(0.0);
+
+				//The alpha value accumulated so far.
+				float accumulatedAlpha = 0.0;
+
+				//How long has the ray travelled so far.
+				float accumulatedLength = 0.0;
+
+				//If we have twice as many samples, we only need ~1/2 the alpha per sample.
+				//Scaling by 256/10 just happens to give a good value for the alphaCorrection slider.
+				float alphaScaleFactor = 25.6 * delta; 				//？？
+
+				vec4 colorSample;
+				float alphaSample;
+
+				//Perform the ray marching iterations
+				for(int i = 0; i < MAX_STEPS; i++){
+
+					//修改
+					vec3 result = (currentPosition - p) * norm;
+					float value = result.x + result.y + result.z;
+					if (value > 0.0){
+							//Get the voxel intensity value from the 3D texture.
+							colorSample = sampleAs3DTexture( currentPosition );
+
+							//Allow the alpha correction customization.
+							alphaSample = colorSample.a * alphaCorrection;
+
+							//Applying this effect to both the color and alpha accumulation results in more realistic transparency.
+							alphaSample *= (1.0 - accumulatedAlpha);
+
+							//Scaling alpha by the number of steps makes the final color invariant to the step size.
+							alphaSample *= alphaScaleFactor;
+
+							//Perform the composition.
+							accumulatedColor += colorSample * alphaSample;
+
+							//Store the alpha accumulated so far.
+							accumulatedAlpha += alphaSample;
+						};
+					//Advance the ray.
+					currentPosition += deltaDirection;
+					accumulatedLength += deltaDirectionLength;
+
+					//If the length traversed is more than the ray length, or if the alpha accumulated reaches 1.0 then exit.
+					if(accumulatedLength >= rayLength || accumulatedAlpha >= 1.0 )
+						break;
+				}
+				gl_FragColor  = accumulatedColor;
+
+			}
+		</script>
+
+		<script>
+			if ( ! Detector.webgl ) Detector.addGetWebGLMessage();
+
+			var container, stats;
+			var camera, sceneFirstPass, sceneSecondPass, renderer;
+			var meshFirstPass, meshSecondPass;
+			var meshCube;
+			// EnterVRButton for rendering enter/exit UI.
+			var vrButton;
+			var vrControls;
+			var effect;
+			var vrDisplay;
+
+			var clock = new THREE.Clock();
+			var rtTexture, transferTexture;
+			var cubeTextures = ['bonsai', 'foot', 'head'];
+			var histogram = [];
+			var guiControls;
+
+			var controller1, controller2;
+
+			var raycaster, intersected = [];
+			var tempMatrix = new THREE.Matrix4();
+			var group;
+			var room;
+
+			var plane, normal;
+
+
+			var referenceObject = new THREE.Object3D();
+			referenceObject.matrixAutoUpdate = false;
+
+			var materialSecondPass;
+			init();
+			setupStage();
+
+
+			function init() {
+
+				//Parameters that can be modified. 	设置GUI
+				guiControls = new function() {
+					this.model = 'bonsai';
+					this.steps = 256.0;
+					this.alphaCorrection = 1.0;
+					this.color1 = [0, 0, 0];
+					this.stepPos1 = 0.1;
+					this.color2 = [0, 255, 0];
+					this.stepPos2 = 0.7;
+					this.color3 = [0, 128, 255];
+					this.stepPos3 = 1.0;
+					this.opacity1 = 0.1;
+					this.opacity2 = 0.7;
+					this.opacity3 = 1.0;
+				};
+
+				container = document.getElementById( 'container' );
+
+				camera = new THREE.PerspectiveCamera( 40, window.innerWidth / window.innerHeight, 0.01, 3000.0 );
+				camera.position.z = 2.0;
+				camera.position.y = 1.0;
+
+
+				controls = new THREE.OrbitControls( camera, container );	//轨道控制器
+				controls.center.set( 0.0, 1.0, 0.0 );
+
+
+				//Load the 2D texture containing the Z slices.
+				cubeTextures['bonsai'] = new THREE.TextureLoader().load('bonsai.raw.png' );
+				cubeTextures['head'] = new THREE.TextureLoader().load('head.raw.png');
+				cubeTextures['foot'] = new THREE.TextureLoader().load('foot.raw.png');
+
+				// cubeTextures['bonsai'] = THREE.ImageUtils.loadTexture('bonsai.raw.png' );
+				// cubeTextures['head'] = THREE.ImageUtils.loadTexture('head.raw.png');
+				// cubeTextures['foot'] = THREE.ImageUtils.loadTexture('foot.raw.png');
+
+
+				//Don't let it generate mipmaps to save memory and apply linear filtering to prevent use of LOD.
+				cubeTextures['bonsai'].generateMipmaps = false;
+				cubeTextures['bonsai'].minFilter = THREE.LinearFilter;
+				cubeTextures['bonsai'].magFilter = THREE.LinearFilter;
+
+				cubeTextures['head'].generateMipmaps = false;
+				cubeTextures['head'].minFilter = THREE.LinearFilter;
+				cubeTextures['head'].magFilter = THREE.LinearFilter;
+
+				cubeTextures['foot'].generateMipmaps = false;
+				cubeTextures['foot'].minFilter = THREE.LinearFilter;
+				cubeTextures['foot'].magFilter = THREE.LinearFilter;
+
+
+				var transferTexture = updateTransferFunction(); 	//转移函数纹理
+
+				var screenSize = new THREE.Vector2( window.innerWidth, window.innerHeight );
+				rtTexture = new THREE.WebGLRenderTarget( screenSize.x, screenSize.y,			//设置渲染目标，用于firstpass
+														{ 	minFilter: THREE.LinearFilter,
+															magFilter: THREE.LinearFilter,
+															wrapS:  THREE.ClampToEdgeWrapping,
+															wrapT:  THREE.ClampToEdgeWrapping,
+															format: THREE.RGBAFormat,
+															type: THREE.FloatType,
+															generateMipmaps: false} );
+
+
+				materialFirstPass = new THREE.ShaderMaterial( {
+					vertexShader: document.getElementById( 'vertexShaderFirstPass' ).textContent,
+					fragmentShader: document.getElementById( 'fragmentShaderFirstPass' ).textContent,
+					side: THREE.BackSide//后面
+				} );
+
+				materialSecondPass = new THREE.ShaderMaterial( {
+					vertexShader: document.getElementById( 'vertexShaderSecondPass' ).textContent,
+					fragmentShader: document.getElementById( 'fragmentShaderSecondPass' ).textContent,
+					side: THREE.FrontSide,			//前面
+					uniforms: {	tex:  { type: "t", value: rtTexture.texture },
+								cubeTex:  { type: "t", value: cubeTextures['bonsai'] },
+								transferTex:  { type: "t", value: transferTexture },
+								steps : {type: "1f" , value: guiControls.steps },
+								alphaCorrection : {type: "1f" , value: guiControls.alphaCorrection },
+								point: { value: new THREE.Vector3()},
+								norm: { value: new THREE.Vector3()}
+							}
+				 });
+
+				sceneFirstPass = new THREE.Scene();
+				sceneSecondPass = new THREE.Scene();
+
+				var boxGeometry = new THREE.BoxGeometry(1.0, 1.0, 1.0);
+				boxGeometry.doubleSided = true;
+
+				meshFirstPass = new THREE.Mesh( boxGeometry, materialFirstPass );
+				meshSecondPass = new THREE.Mesh( boxGeometry, materialSecondPass );
+
+				meshFirstPass.matrixAutoUpdate = false;
+				meshSecondPass.matrixAutoUpdate = false;
+
+				// meshFirstPass.matrix.setPosition(new THREE.Vector3(0, 1, 0));
+				// meshSecondPass.matrix.setPosition(new THREE.Vector3(0, 1, 0));
+
+				// meshFirstPass.position.y = 1.0;
+				// meshSecondPass.position.y = 1.0;
+
+
+				sceneFirstPass.add( meshFirstPass );
+				sceneSecondPass.add( meshSecondPass );
+				meshFirstPass.matrix.setPosition(new THREE.Vector3(0, 1, 0));
+				meshSecondPass.matrix.setPosition(new THREE.Vector3(0, 1, 0));
+
+				renderer = new THREE.WebGLRenderer();
+				renderer.setPixelRatio(window.devicePixelRatio);
+				//renderer.vr.enabled = true;
+				container.appendChild( renderer.domElement );
+
+				stats = new Stats();				//性能检测，提供运行帧数数据
+				stats.domElement.style.position = 'absolute';
+				stats.domElement.style.top = '0px';
+				container.appendChild( stats.domElement );
+
+
+				var gui = new dat.GUI();
+				var modelSelected = gui.add(guiControls, 'model', [ 'bonsai', 'foot', 'head' ] );
+				gui.add(guiControls, 'steps', 0.0, 512.0);
+				gui.add(guiControls, 'alphaCorrection', 0.01, 5.0).step(0.01);
+				//改变纹理
+				modelSelected.onChange(function(value) { materialSecondPass.uniforms.cubeTex.value =  cubeTextures[value]; } );
+
+
+				//Setup transfer function steps.
+				var step1Folder = gui.addFolder('Step 1');
+				var controllerColor1 = step1Folder.addColor(guiControls, 'color1');
+				var controllerOpacity1 = step1Folder.add(guiControls, 'opacity1', 0.0, 1.0);
+				var controllerStepPos1 = step1Folder.add(guiControls, 'stepPos1', 0.0, 1.0);
+				controllerColor1.onChange(updateTextures);
+				controllerStepPos1.onChange(updateTextures);
+				controllerOpacity1.onChange(updateTextures);
+
+
+				var step2Folder = gui.addFolder('Step 2');
+				var controllerColor2 = step2Folder.addColor(guiControls, 'color2');
+				var controllerOpacity2 = step2Folder.add(guiControls, 'opacity2', 0.0, 1.0);
+				var controllerStepPos2 = step2Folder.add(guiControls, 'stepPos2', 0.0, 1.0);
+				controllerColor2.onChange(updateTextures);
+				controllerStepPos2.onChange(updateTextures);
+				controllerOpacity2.onChange(updateTextures);
+
+
+				var step3Folder = gui.addFolder('Step 3');
+				var controllerColor3 = step3Folder.addColor(guiControls, 'color3');
+				var controllerOpacity3 = step3Folder.add(guiControls, 'opacity3', 0.0, 1.0);
+				var controllerStepPos3 = step3Folder.add(guiControls, 'stepPos3', 0.0, 1.0);
+				controllerColor3.onChange(updateTextures);
+				controllerStepPos3.onChange(updateTextures);
+				controllerOpacity3.onChange(updateTextures);
+
+
+				step1Folder.open();
+				step2Folder.open();
+				step3Folder.open();
+
+
+				onWindowResize();
+
+				window.addEventListener( 'resize', onWindowResize, false );
+
+
+
+				room = new THREE.Mesh(
+					new THREE.BoxBufferGeometry( 6, 6, 6, 6, 6, 6 ),
+					new THREE.MeshBasicMaterial( { color: 0x404040, wireframe: true } )
+				);
+				room.position.y = 3;
+				sceneSecondPass.add( room );
+
+				sceneSecondPass.add( new THREE.HemisphereLight( 0x606060, 0x404040 ) );
+
+
+				var cubeMaterial = new THREE.MeshBasicMaterial({color: 0xff0000, opacity: 0.0, transparent: true});
+				meshCube = new THREE.Mesh(boxGeometry, cubeMaterial);
+				meshCube.position.y = 1.0;
+
+				// meshCube.matrix.setPosition(new THREE.Vector3(1, 0, 0));
+				// meshCube.matrix.decompose( meshCube.position, meshCube.quaternion, meshCube.scale );
+				// alert(meshCube.position.x);
+				// meshCube.matrixAutoUpdate = false;
+
+				var planeGeometry = new THREE.PlaneGeometry(1, 1, 1, 1);
+				var planeMaterial = new THREE.MeshNormalMaterial();
+				planeMaterial.side = THREE.DoubleSide;
+				plane = new THREE.Mesh(planeGeometry, planeMaterial);
+
+				group = new THREE.Group();
+				// sceneFirstPass.add(group);
+				sceneSecondPass.add( group );
+				// group.add(meshFirstPass);
+				// group.add(meshSecondPass);
+				group.add(meshCube);
+				group.add(plane);
+				//alert(meshCube.id);//8
+				//alert(group.id);//17
+				vrControls = new THREE.VRControls(camera);
+				vrControls.standing = true;
+  			camera.position.y = vrControls.userHeight;
+
+
+			  // Apply VR stereo rendering to renderer.
+			  effect = new THREE.VREffect(renderer);
+			  effect.setSize(window.innerWidth, window.innerHeight);
+
+
+				var uiOptions = {
+					color: 'black',
+					background: 'white',
+					corners: 'square'
+				};
+				vrButton = new webvrui.EnterVRButton(renderer.domElement, uiOptions);
+				vrButton.on('exit', function() {
+					camera.quaternion.set(0, 0, 0, 1);
+					camera.position.set(0, vrControls.userHeight, 0);
+				});
+				vrButton.on('hide', function() {
+					document.getElementById('ui').style.display = 'none';
+				});
+				vrButton.on('show', function() {
+					document.getElementById('ui').style.display = 'inherit';
+				});
+				document.getElementById('vr-button').appendChild(vrButton.domElement);
+				document.getElementById('magic-window').addEventListener('click', function() {
+				vrButton.requestEnterFullscreen();
+				});
+
+
+				controller1 = new THREE.ViveController( 0 );
+				//controller1.standingMatrix = renderer.vr.getStandingMatrix();
+				controller1.standingMatrix = vrControls.getStandingMatrix();
+				controller1.addEventListener( 'triggerdown', onTriggerDown );
+				controller1.addEventListener( 'triggerup', onTriggerUp );
+				sceneSecondPass.add( controller1 );
+				controller1.visible = false;
+				//alert(controller1.id);//20
+
+				controller2 = new THREE.ViveController( 1 );
+				//controller2.standingMatrix = renderer.vr.getStandingMatrix();
+				controller2.standingMatrix = vrControls.getStandingMatrix();
+				controller2.addEventListener( 'triggerdown', onTriggerDown );
+				controller2.addEventListener( 'triggerup', onTriggerUp );
+				sceneSecondPass.add( controller2 );
+				controller2.visible = false;
+				//alert(controller2.parent.id);//5
+				var loader = new THREE.OBJLoader();
+				loader.setPath( 'vive-controller/' );
+				loader.load( 'vr_controller_vive_1_5.obj', function ( object ) {
+
+							var loader = new THREE.TextureLoader();
+							loader.setPath( 'vive-controller/' );
+
+							var controller = object.children[ 0 ];
+							controller.material.map = loader.load( 'onepointfive_texture.png' );
+							controller.material.specularMap = loader.load( 'onepointfive_spec.png' );
+
+							controller1.add( object.clone() );
+							controller2.add( object.clone() );
+
+				} );
+
+				var geometry = new THREE.BufferGeometry().setFromPoints( [ new THREE.Vector3( 0, 0, 0 ), new THREE.Vector3( 0, 0, - 1 ) ] );
+
+				var line = new THREE.Line( geometry );
+				line.name = 'line';
+				line.scale.z = 5;
+
+				controller1.add( line.clone() );
+				controller2.add( line.clone() );
+
+				raycaster = new THREE.Raycaster();
+
+
+				normal = new THREE.Vector3(0, 0, -1);
+
+				//plane.rotation.x = Math.PI/4;
+				plane.rotation.y = Math.PI/2;
+			  //plane.position.z = 1.0;
+				plane.position.y = 1.15;
+				plane.position.z = 1.1;
+
+				sceneSecondPass.add(referenceObject);
+				updateCutPlane();
+
+			}
+
+			function updateTextures(value){
+				materialSecondPass.uniforms.transferTex.value = updateTransferFunction();
+			}
+
+			function updateTransferFunction(){
+				var canvas = document.createElement('canvas');
+				canvas.height = 20;
+				canvas.width = 256;
+
+				var ctx = canvas.getContext('2d');
+
+				var grd = ctx.createLinearGradient(0, 0, canvas.width -1 , canvas.height - 1);
+				console.log(guiControls.color1);
+				console.log(guiControls.opacity1);
+
+				//grd.addColorStop(guiControls.stepPos1,'rgba(0,0,0,0)');
+				grd.addColorStop(guiControls.stepPos1, 'rgba(' + guiControls.color1[0] + ',' + guiControls.color1[1] + ',' + guiControls.color1[2] + ',' + guiControls.opacity1 + ')');
+				grd.addColorStop(guiControls.stepPos2, 'rgba(' + guiControls.color2[0] + ',' + guiControls.color2[1] + ',' + guiControls.color2[2] + ',' + guiControls.opacity2 + ')');
+				grd.addColorStop(guiControls.stepPos3, 'rgba(' + guiControls.color3[0] + ',' + guiControls.color3[1] + ',' + guiControls.color3[2] + ',' + guiControls.opacity3 + ')');
+
+				ctx.fillStyle = grd;
+				ctx.fillRect(0,0,canvas.width -1 ,canvas.height -1 );
+
+				var img = document.getElementById("transferFunctionImg");
+				img.src = canvas.toDataURL();
+				img.style.width = "256 px";
+				img.style.height = "128 px";
+
+				transferTexture =  new THREE.Texture(canvas);				//转移函数纹理
+				transferTexture.wrapS = transferTexture.wrapT =  THREE.ClampToEdgeWrapping;
+				transferTexture.needsUpdate = true;
+
+				return transferTexture;
+			}
+
+			function onWindowResize( event ) {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+			}
+
+			function updateCutPlane(){
+				normal = new THREE.Vector3(0, 0, -1);
+
+				plane.updateMatrixWorld();
+				meshCube.updateMatrixWorld();
+				// console.log(plane.matrixWorld);
+				// console.log(meshCube.matrixWorld);
+
+				var temM = new THREE.Matrix4();
+				temM.getInverse(meshCube.matrixWorld);
+				temM.multiply(plane.matrixWorld);
+				//console.log(temM);
+				referenceObject.matrix = temM;
+				//referenceObject.matrix.multiply(plane.matrixWorld);
+				// console.log(referenceObject);
+
+
+				referenceObject.matrix.decompose(referenceObject.position, referenceObject.quaternion, referenceObject.scale);
+				//plane.matrix.decompose(referenceObject.position, referenceObject.quaternion, referenceObject.scale);
+				var m = new THREE.Matrix4();
+				var m1 = new THREE.Matrix3();
+				m.makeRotationFromQuaternion(referenceObject.quaternion);
+				m1.getNormalMatrix(m);
+				normal.applyMatrix3(m1);
+				materialSecondPass.uniforms.point.value = referenceObject.position;
+				materialSecondPass.uniforms.norm.value = normal;
+				// console.log(referenceObject.position);
+				// console.log(normal);
+
+			}
+
+
+
+
+			function animate() {
+
+				if (vrDisplay && vrButton.isPresenting()) {
+			    vrDisplay.requestAnimationFrame(animate);
+					controller1.visible = true;
+					controller2.visible = true;
+
+					vrRender();
+
+					vrControls.update();
+			  } else {
+			    requestAnimationFrame(animate);
+					render();
+					//controls.update();
+			  };
+
+				//requestAnimationFrame( animate );
+
+				stats.update();
+
+
+				// controller1.update();
+				// controller2.update();
+				// if (vrButton.isPresenting()) {
+				// 	vrControls.update();
+				// }
+			}
+
+			function render() {
+
+				var delta = clock.getDelta();
+
+				//Render first pass and store the world space coords of the back face fragments into the texture.
+				renderer.render( sceneFirstPass, camera, rtTexture, true );//渲染到目标reTexture
+
+				//Render the second pass and perform the volume rendering.
+				renderer.render( sceneSecondPass, camera );
+
+				// Render the scene.
+				// effect.render(sceneFirstPass, camera, rtTexture, true);
+				// effect.render( sceneSecondPass, camera );
+
+				materialSecondPass.uniforms.steps.value = guiControls.steps;
+				materialSecondPass.uniforms.alphaCorrection.value = guiControls.alphaCorrection;
+			}
+
+			function setupStage() {
+			  navigator.getVRDisplays().then(function(displays) {
+
+			    if (displays.length > 0 ) {
+			      vrDisplay = displays[0];
+			      // if (vrDisplay.stageParameters) {
+			      //   setStageDimensions(vrDisplay.stageParameters);
+			      // }
+			    }
+					animate();
+
+			  });
+			}
+
+
+			function vrRender() {
+
+				controller1.update();
+				controller2.update();
+
+				cleanIntersected();
+
+				intersectObjects( controller1 );
+				intersectObjects( controller2 );
+
+				// meshFirstPass.position.y = meshCube.position.y;
+				// meshSecondPass.position.y = meshCube.position.y;
+
+				var delta = clock.getDelta();
+
+				meshCube.updateMatrixWorld();
+				meshFirstPass.matrix = meshCube.matrixWorld;
+				meshSecondPass.matrix = meshCube.matrixWorld;
+				meshFirstPass.matrix.decompose( meshFirstPass.position, meshFirstPass.quaternion, meshFirstPass.scale );
+				meshSecondPass.matrix.decompose( meshSecondPass.position, meshSecondPass.quaternion, meshSecondPass.scale );
+
+
+				// Render first pass and store the world space coords of the back face fragments into the texture.
+				// renderer.render( sceneFirstPass, camera, rtTexture, true );//渲染到目标reTexture
+
+				// Render the second pass and perform the volume rendering.
+				// renderer.render( sceneSecondPass, camera );
+
+
+				// Render the scene.
+				//effect.render(sceneFirstPass, camera, rtTexture, true);
+
+				effect.render( sceneSecondPass, camera, rtTexture, sceneFirstPass);
+
+				//vrDisplay.requestAnimationFrame(vrAnimate);
+				materialSecondPass.uniforms.steps.value = guiControls.steps;
+				materialSecondPass.uniforms.alphaCorrection.value = guiControls.alphaCorrection;
+
+				updateCutPlane();
+			}
+
+
+			function onTriggerDown( event ) {
+				//alert(1);//单次执行
+				var controller = event.target;
+				//alert(controller.parent.id);//5
+				//alert(controller.id);//21
+				var intersections = getIntersections( controller );
+
+				if ( intersections.length > 0 ) {
+
+					var intersection = intersections[ 0 ];
+					// ??防止由于父对象变化产生的突变问题
+					tempMatrix.getInverse( controller.matrixWorld );
+
+					var object = intersection.object;
+					//alert(object.parent.id);//17
+
+					//？？对象的矩阵(matrix)存储对象相对于对象的父对象(parent)的转换
+					//子对象的所有定位、旋转和变形都是相对于父对象的
+					object.matrix.premultiply( tempMatrix );
+					//用于通过矩阵更新其他三个信息
+					object.matrix.decompose( object.position, object.quaternion, object.scale );//防止物体位置突变
+
+					//改变颜色
+					//object.material.emissive.b = 1;
+					controller.add( object );
+					//alert(object.parent.id);//20
+					controller.userData.selected = object;
+
+					// object.updateMatrixWorld();
+					// meshFirstPass.matrix = object.matrixWorld;
+					// meshSecondPass.matrix = object.matrixWorld;
+					// meshFirstPass.matrix.decompose( meshFirstPass.position, meshFirstPass.quaternion, meshFirstPass.scale );
+					// meshSecondPass.matrix.decompose( meshSecondPass.position, meshSecondPass.quaternion, meshSecondPass.scale );
+
+					 //updateCutPlane();
+				}
+
+			}
+
+			function onTriggerUp( event ) {
+
+				var controller = event.target;
+
+				if ( controller.userData.selected !== undefined ) {
+
+					var object = controller.userData.selected;
+					object.matrix.premultiply( controller.matrixWorld );
+					//用于通过矩阵更新其他三个信息
+					object.matrix.decompose( object.position, object.quaternion, object.scale );
+					//object.material.emissive.b = 0;
+					group.add( object );
+
+					controller.userData.selected = undefined;
+
+					//updateCutPlane();
+				}
+
+
+			}
+
+			function getIntersections( controller ) {
+
+				tempMatrix.identity().extractRotation( controller.matrixWorld );
+
+				raycaster.ray.origin.setFromMatrixPosition( controller.matrixWorld );
+				raycaster.ray.direction.set( 0, 0, -1 ).applyMatrix4( tempMatrix );
+
+				return raycaster.intersectObjects( group.children );
+
+			}
+
+			function intersectObjects( controller ) {
+
+				// Do not highlight when already selected
+
+				if ( controller.userData.selected !== undefined ) return;
+
+				var line = controller.getObjectByName( 'line' );
+				var intersections = getIntersections( controller );
+
+				if ( intersections.length > 0 ) {
+
+					var intersection = intersections[ 0 ];
+
+					var object = intersection.object;
+					//object.material.emissive.r = 1;
+					intersected.push( object );
+
+					line.scale.z = intersection.distance;
+
+				} else {
+
+					line.scale.z = 5;
+
+				}
+
+			}
+
+			function cleanIntersected() {
+
+				while ( intersected.length ) {
+
+					var object = intersected.pop();
+					//object.material.emissive.r = 0;
+
+				}
+
+			}
+
+
+		</script>
+
+	</body>
+</html>
